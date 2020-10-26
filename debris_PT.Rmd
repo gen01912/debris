@@ -1,0 +1,1033 @@
+---
+title: "Débris de pertes totales"
+output: html_notebook
+---
+
+# Mise en contexte
+
+# Librairies
+```{r}
+library(readr)
+library(extraw)
+library(data.table)
+library(DBI)
+library(dplyr)
+```
+
+# Importations
+## Importations données des fournisseurs
+```{r}
+debris <- read_csv("~/R/debris_pertes_totales/pt_recouvrement.csv")
+
+# Présence d'espaces dans certains champs numérique dans le CSV
+debris$VNTFRAISBRUT <- gsub("\xa0","",debris$VNTFRAISBRUT)
+debris$VNTFRAISBRUT <- as.numeric(debris$VNTFRAISBRUT)
+debris$VNTAUTFRAISBRUT <- gsub("\xa0","",debris$VNTAUTFRAISBRUT)
+debris$VNTAUTFRAISBRUT <- as.numeric(debris$VNTAUTFRAISBRUT)
+
+# Remplacer les NA des champs numériques par des 0
+debris <- debris %>% tidyr::replace_na(list(VNTFRAISNET=0, 
+                                            VNTFRAISBRUT=0,
+                                            VNTAUTFRAISNET=0,
+                                            VNTAUTFRAISBRUT=0)) %>% as.data.table()
+
+
+
+#str(debris)
+```
+
+## Importations données de sinistres et de polices de La Capitale
+```{r}
+
+
+dtsin_CGEN <- get_claims(from = as.Date("2015-01-01"),
+                    to = Sys.Date() - 1,
+                    at = Sys.Date(),
+                    filters = list("PROD_CODE" = "VT" ),
+                    detailid = c(2492,2612,2614,2692,2713,8665,11410,11247,11409,14663:14676),
+                    partial = c("AMT","CIR", "CMT","ROL"),
+                    denormalize = TRUE,
+                    forcegcp = TRUE)
+
+# Parce qu'on est sur BigQuery, les datas vivent pendant 24h, on peut recuperer le TMP_RISQ creer par get_claims
+con <- init_con(forcegcp = TRUE)
+
+dtpol_CGEN <- build_policies(con,
+                        gsub("`","",tail(sort(extraw::get_table("TMP_RISQ", forcegcp = TRUE)$TABLE),1)),
+                        c(23, 59, 80, 84, 85, 86, 87, 88, 91, 92, 96, 147, 151, 152, 153, 154, 11733, 13551, 13696, 13697),
+                        partial = c("PRO", "ROL", "COV"),
+                        denormalize = TRUE)
+
+dtsin_CGEN[, MACTA_ID := SINI_MACTA_ID]
+setkey(dtpol_CGEN, MACTA_ID)
+setkey(dtsin_CGEN, MACTA_ID)
+
+pos <- which(!names(dtpol_CGEN) %in% names(dtsin_CGEN))
+
+dtsin_CGEN[, names(dtpol_CGEN)[pos] := dtpol_CGEN[dtsin_CGEN[, list(SINI_MACTA_ID)], pos, with = FALSE]]
+
+```
+## Importations données d'Audatex
+```{r}
+
+AUDATEX <- as.data.table(unique(dtsin_CGEN$MSINI_ID))
+names(AUDATEX)[1] <- 'MSINI_ID'
+
+
+audatex_fonc <- function(MSINI_ID)
+{
+ 
+  MSINI_ID <- as.data.table(MSINI_ID)
+  setnames(MSINI_ID, "MSINI_ID")
+  
+  extraw::dbWriteTable(con, "TMP_MSINI_ID", MSINI_ID[, .(MSINI_ID)], overwrite = TRUE)
+
+  SQL <- paste0("SELECT  t.MSINI_ID, 
+                         e.MNT_GRAND_TOTL, 
+                         e.VAL_MOY_TYPQ_AUTO,
+                         e.KM_MOY,
+                         e.MNT_TRAV_REMPLCMNT_TOTL, 
+                         e.MNT_TRAV_REPARTN_TOTL, 
+                         e.NB_HR_TRAV_REMPLCMNT_TOTL, 
+                         e.NB_HR_TRAV_REPARTN_TOTL
+                         
+              
+                 FROM TMP_MSINI_ID as t
+                 join `prod-cap-lake-sedo-data.RAW_SEDO_DM_PROD.D_TBL_DOSSIER_INDEMNISATION` as d
+                 on t.MSINI_ID = d.NO_DOSS_INDEMN
+                 
+                 join `prod-cap-lake-sedo-data.RAW_SEDO_DM_PROD.F_TBL_ESTIMATION_INDEMNISATION_AUTO` as e
+                 on d.ID_DOSS_INDEMN = e.ID_DOSS_INDEMN
+                 
+                 join  (select ID_DOSS_INDEMN, 
+                               max(NO_ESTMTN) as NO_ESTMTN,
+                               max(NO_VERSN_ESTMTN_COMPTOIR)  as NO_VERSN_ESTMTN_COMPTOIR 
+                		     from `prod-cap-lake-sedo-data.RAW_SEDO_DM_PROD.F_TBL_ESTIMATION_INDEMNISATION_AUTO` 
+                		     where MNT_GRAND_TOTL >0
+              		       group by ID_DOSS_INDEMN) f
+                 on e.ID_DOSS_INDEMN = f.ID_DOSS_INDEMN   
+                 and e.NO_VERSN_ESTMTN_COMPTOIR = f.NO_VERSN_ESTMTN_COMPTOIR
+                 and e.NO_ESTMTN = f.NO_ESTMTN
+                 
+                 ;")
+
+  
+  
+  
+  dt <- setDT(dbGetQuery(con, SQL))
+  return(dt)
+  
+  
+  
+}
+AUDATEX  <- audatex_fonc(AUDATEX$MSINI_ID)
+
+
+
+```
+
+## Importations données de sinistres et de polices de L'Unique
+```{r}
+```
+
+## Jonctions et filtres
+```{r}
+DD <- inner_join(debris, dtsin_CGEN, by = c("NO_DOSS_INDEMN" = "MSINI_ID")) %>% 
+  filter(COMPAGNIE == "Capitale")
+
+DD <- left_join(DD,AUDATEX, by = c("NO_DOSS_INDEMN" = "MSINI_ID"))
+
+
+
+
+
+# Calcul du % de valeur marchande
+DD <- DD %>% mutate(PCT_VALMARCH = 100*VNTMNTNET/VEHVALEUR)
+# enlever les données de l'ancienne entente
+DD <- DD[round(PCT_VALMARCH,1) !=9.0]
+
+
+
+
+# Plage de temps (à cause des données Audatex)
+DD <- DD %>% filter(VNTDATE>"2018-05-10")
+
+DD <- DD[] %>% select(-grep("^GARA_FAQ1", colnames(DD)))
+DD <- DD[] %>% select(-grep("^GARA_FAQ2", colnames(DD)))
+DD <- DD[] %>% select(-grep("^GARA_FAQ3", colnames(DD)))
+DD <- DD[] %>% select(-grep("^GARA_2", colnames(DD)))
+DD <- DD[] %>% select(-grep("^GARA_P", colnames(DD)))
+DD <- DD[] %>% select(-grep("^GARA_AIR", colnames(DD)))
+DD <- DD[] %>% select(-grep("^GARA_RED", colnames(DD)))
+DD <- DD[] %>% select(-grep("^DRIVE_TIME", colnames(DD)))
+DD <- DD[] %>% select(-grep("^ROLE_PROPR", colnames(DD)))
+DD <- DD[] %>% select(-grep("^ROLE_SEC", colnames(DD)))
+DD <- DD[] %>% select(-grep("^TRNS_", colnames(DD)))
+DD <- DD[] %>% select(-(   grep("^GARA_B", colnames(DD)) & !grep("PRESENCE",colnames(DD))  ))
+DD <- DD[] %>% select(-(   grep("^GARA_CHAP", colnames(DD)) & !grep("PRESENCE",colnames(DD))  ))
+DD <- DD[] %>% select(-(   grep("^ROLE_", colnames(DD)) & !grep("PRESENCE",colnames(DD))  ))
+DD <- DD[] %>% select(-(   grep("^GARA_FAQ4", colnames(DD)) & !grep("PRESENCE",colnames(DD))  ))
+
+names(DD)
+
+
+# On veut modéliser uniquement le % que représente le montant net de vente p/r à la valeur marchande
+# On doit donc garder que les véhicules qui ont été a l'encan
+DD <- DD[VNTTYPE=='Encan']
+
+# Valeurs abérentes
+
+DD <- DD[NO_DOSS_INDEMN != 73110281]
+
+
+# Péparation 
+
+
+DD <- DD[is.na(CIRC_PTCAPOUV),  CIRC_PTCAPOUV := "NESAITPAS"]
+DD <- DD[is.na(CIRC_PTENDROI),  CIRC_PTENDROI := "AUTRE"]
+#DD <- DD[,PTENDROI := case_when(CIRC_PTENDROI == "REMORQUEUR" ~ 1, TRUE ~ 0)]
+#DD <- DD[is.na(CIRC_PTNBCGON),  CIRC_PTNBCGON := "NESAITPAS"]
+DD <- DD %>% mutate(PTNBCGON = case_when(CIRC_PTNBCGON == "NBCOUGON0" ~ 0,
+                                         CIRC_PTNBCGON == "NBCOUGON1" ~ 1,
+                                         CIRC_PTNBCGON == "NBCOUGON2PLUS" ~ 2))
+  
+DD <- DD[is.na(CIRC_PTNBRIMP),  CIRC_PTNBRIMP := "NESAITPAS"]
+DD <- DD %>% mutate(PTNBRIMP = case_when(CIRC_PTNBRIMP == "NBIMPACTS2" ~ 2,
+                                CIRC_PTNBRIMP == "NBIMPACTS3PLUS" ~ 3,
+                                TRUE ~ 1))
+  
+DD <- DD[(is.na(CIRC_PTRADEND) | CIRC_PTRADEND == 'NESAITPAS') & CIRC_REMORQ == 'O' ,  
+         CIRC_PTRADEND := "OUI"]
+DD <- DD[(is.na(CIRC_PTRADEND) | CIRC_PTRADEND == 'NESAITPAS') & CIRC_REMORQ == 'N' ,  
+         CIRC_PTRADEND := "NON"]
+
+
+DD<- DD[,PROD_MARQUE_VTREFVEH := ifelse(PROD_MARQUE_VTREFVEH=='B.M.W.', 'BMW',PROD_MARQUE_VTREFVEH)]
+
+DD<- DD[!(PROD_MARQUE_VTREFVEH %in% c('MASERATI','SATURN','JAGUAR','LAND ROVER','TESLA'))]
+DD<- DD[,PROD_MARQUE_VTREFVEH := as.factor(PROD_MARQUE_VTREFVEH)]
+
+
+
+
+```
+
+
+# Ajout de variables
+## Calcul du montant recouvré
+```{r}
+DD <- DD %>% mutate(MNT_RECOUV = VNTMNTNET - VNTFRAISNET - POUTOTALNET)
+
+
+ggplot(DD[MNT_RECOUV<10000],aes(x=MNT_RECOUV)) + geom_histogram(aes(y =..density..), bins = 200) + facet_grid(VNTANNEE~.)
+
+#ggplot(DD[VNTTYPE == "Achat"],aes(x=MNT_RECOUV)) +   geom_histogram(bins = 200) + 
+# scale_y_log10()+   facet_wrap(VNTANNEE~., ncol = 3) + xlim(-2000,1500) + labs(title = "Achat")
+
+ggplot(DD[VNTTYPE == "Encan"],aes(x=MNT_RECOUV)) + 
+  geom_histogram(bins = 200) + 
+  scale_y_log10()+
+  facet_wrap(VNTANNEE~., ncol = 3) + xlim(-2000,15000) + labs(title = "Encan")
+
+
+ggplot(DD[VNTTYPE == "Encan"],aes(x=VNTDATE,y=MNT_RECOUV)) + 
+  geom_point(alpha = 0.1) + 
+  scale_y_log10()+
+  facet_wrap(VNTANNEE~., ncol = 3, scales = 'free_x')  + labs(title = "Encan")
+```
+
+## Calcul du % de valeur marchande
+```{r}
+#DD <- DD %>% mutate(PCT_VALMARCH = VNTMNTNET/VEHVALEUR)
+
+summary(DD$PCT_VALMARCH)
+
+
+ggplot(DD[],aes(x=PCT_VALMARCH)) + geom_histogram(bins = 200) 
+
+ggplot(DD[],aes(x=VNTMNTNET)) + geom_histogram(bins = 200) 
+ggplot(DD[],aes(x=log(VNTMNTNET))) + geom_histogram(bins = 200)
+ggplot(DD[],aes(x=VNTMNTNET^(1/2))) + geom_histogram(bins = 200)
+ggplot(DD[],aes(x=log(VNTMNTNET^(1/2)))) + geom_histogram(bins = 200)
+
+ggplot(DD[],aes(x=PCT_VALMARCH)) + 
+  geom_histogram(aes(y =..density..), bins = 200) + 
+  geom_vline(xintercept = 12.5, color = "red") + 
+  facet_grid(VNTANNEE~.)
+
+
+ggplot(DD[VNTTYPE == "Encan"],aes(x=VNTDATE,y=PCT_VALMARCH)) + 
+  geom_point(alpha = 0.1) + 
+  #scale_y_log10()+
+  facet_wrap(VNTANNEE~., ncol = 3, scales = 'free_x')  + labs(title = "Encan")
+
+
+```
+
+## Âge du véhicule
+```{r}
+DD <- DD %>% mutate(VEH_AGE = VNTANNEE - VEHANNEE)
+
+DD %>% count(DD$VEH_AGE)
+
+ggplot(DD,aes(VEH_AGE)) + stat_count()
+
+ggplot(DD,aes(VEH_AGE,PCT_VALMARCH)) + 
+  geom_count( alpha = 0.1) 
+
+
+ggplot(DD,aes(VEH_AGE,VNTMNTNET)) + 
+  geom_count( alpha = 0.05) 
+
+ggplot(DD2,aes(VEH_AGE,VNTMNTNET)) + 
+  geom_count( alpha = 0.05) 
+
+ggplot(DD,aes(as.factor(VEH_AGE),VNTMNTNET^(1/2))) + 
+  geom_count( alpha = 0.1) 
+
+
+ggplot(DD2, aes(x=VEHVALEUR, y = VNTMNTNET)) + 
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 0.125) + 
+  facet_grid(VEH_AGE~.) + xlim(0,35000) + ylim(0,14000)
+
+
+```
+
+## Exclusion de données et règles de l'entente
+```{r}
+
+# Tous les VT de 12 ans et plus doivent aller au rachat automatiquement
+DD <- DD[!(VEH_AGE>=12)]
+
+# Tous les VT volés/retrouvés doivent aller directement à l'encan
+DD <- DD[TYPECIRC != "THEFT"]
+
+# Séparer le jeux de données en 2 sections dues aux clauses de l'entente:
+## véhicule qui n'ont qu'un choix 
+DD1 <- DD[VEH_AGE<=5]
+
+ggplot(DD1, aes(PCT_VALMARCH)) + geom_histogram(bins = 200) + geom_vline(xintercept = 12.5,color = 'red')
+
+## véhicule qui doient être répartis correctement entre l'encan ou le rachat.
+DD2 <- DD[VEH_AGE>5]
+```
+
+
+# Exploration des données
+
+```{r}
+# plusieurs NO_DOSS_INDEM = 999
+NROW(debris)
+NROW(unique(debris$NO_DOSS_INDEMN))
+
+NROW(DD)
+
+
+
+```
+
+## COMPAGNIE, FOURNISSEUR
+```{r}
+debris %>% count(COMPAGNIE)
+DD %>% count(COMPAGNIE)
+
+# Depuis mars 2020, on fait affaire avec Impact uniquement 
+DD %>% count(FOURNISSEUR)
+```
+
+
+## VEHMARQUE & VEHMODELE
+```{r}
+# Pas uniforme, mieux d'utiliser ce qu'on a dans nos système 
+unique(DD$PROD_MARQUE_VTREFVEH)
+toto <- table(DD$PROD_MARQUE_VTREFVEH, DD$VEHMARQUE, deparse.level = 2) %>% as.data.table() %>% filter(N!=0)
+# VEHMARQUE mal remplis : TOYOTA, TOYO et TOYT existent par exemple
+
+DD %>% count(PROD_MARQUE_VTREFVEH) %>%  arrange(desc(PROD_MARQUE_VTREFVEH)) 
+DD  %>% count(PROD_MARQUE_VTREFVEH) %>%  arrange(desc(n))
+DD  %>% count(PROD_MARQUE_VTREFVEH) %>%  arrange(n)
+ggplot(DD,aes(x=PROD_MARQUE_VTREFVEH)) + geom_bar() + coord_flip()
+
+DD %>% select(PROD_MARQUE_VTREFVEH, PCT_VALMARCH) %>% filter(PROD_MARQUE_VTREFVEH %in% c('TESLA','PORSCHE','JAGUAR')) %>% arrange(desc(PCT_VALMARCH))
+
+
+groupe_marque <- DD %>% 
+  group_by(PROD_MARQUE_VTREFVEH) %>% 
+  summarise(N = n(), min = min(PCT_VALMARCH), max = max(PCT_VALMARCH), moy = mean(PCT_VALMARCH), sd = sd(PCT_VALMARCH)) %>% 
+  ungroup() %>% 
+  arrange(desc(moy))
+
+#DD %>% count(VEHMODELE)
+```
+
+## VEHANNEE
+```{r}
+DD %>% count(VEHANNEE)
+ggplot(DD[VEHANNEE >= 1985],aes(x=VEHANNEE)) + geom_bar()
+min(DD$VEHANNEE) 
+max(DD$VEHANNEE)
+
+
+ggplot(DD[VEHANNEE>=2002], aes(x=VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1) + facet_wrap(VEHANNEE~.)
+
+ggplot(DD[VEHANNEE==2020], aes(x=VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1) + geom_abline(slope = 0.125)
+ggplot(DD[VEHANNEE==2019], aes(x=VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1) + geom_abline(slope = 0.125)
+ggplot(DD[VEHANNEE==2018], aes(x=VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1) + geom_abline(slope = 0.125)
+ggplot(DD[VEHANNEE==2017], aes(x=VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1) + geom_abline(slope = 0.125)
+```
+
+## VEHVALEUR
+```{r}
+DD %>% count(VEHVALEUR)
+ggplot(DD,aes(x=VEHVALEUR)) + geom_histogram(binwidth = 50)
+min(DD$VEHVALEUR)
+max(DD$VEHVALEUR) 
+# +100k ce sont des motorhome - est-ce qu'on les garde dans l'analyse ? Sam: NON
+
+
+ggplot(DD, aes(VEHVALEUR, CIRC_VALJOUSI)) + geom_point() + ylim(-1,150000) + xlim(-1,150000)
+ggplot(DD, aes(VEHVALEUR, VAL_MOY_TYPQ_AUTO)) + geom_point()  + ylim(-1,150000) + xlim(-1,150000)
+
+
+
+```
+## VEHBRAND, VNTTYPE, VNTENDROIT
+```{r}
+#Variable disponible seulement pour Impact et pas toujours bien remplie…
+DD %>% count(VEHBRAND)
+
+#faire qqchose avec les provinces /USA ? 
+
+
+ggplot(DD,aes(VEHBRAND, fill=VNTTYPE)) + 
+  geom_bar( position="dodge") +
+  scale_y_log10() + 
+  coord_flip() 
+
+ggplot(DD,aes(TYPECIRC, fill = VEHBRAND )) + geom_bar(position = 'dodge') + scale_y_log10()
+ggplot(DD,aes(VEHBRAND , fill = TYPECIRC )) + geom_bar(position = 'dodge') + scale_y_log10() + coord_flip() 
+
+ggplot(DD,aes(x= PCT_VALMARCH)) + 
+  geom_histogram(position = "dodge")+  
+  facet_wrap(VEHBRAND~.)
+
+
+
+# Type de vente : encan, achat à prix fixe, basket (habituellement auto complètement brûlé ou submergé)
+debris %>% count(VNTTYPE)
+
+ggplot(DD,aes(CIRC_PTSITPAR, fill = VNTTYPE)) + geom_bar(position = 'dodge') + scale_y_log10()
+
+# croiser avec circonstance ? 
+ggplot(DD,aes(TYPECIRC, fill = VNTTYPE )) + geom_bar(position = 'dodge') #+ scale_y_log10()
+
+ggplot(DD,aes(x= PCT_VALMARCH)) + 
+  geom_histogram(position = "dodge")+  
+  facet_wrap(CIRC_PTSITPAR~.)
+
+
+
+
+debris %>% count(VNTENDROIT)
+
+ggplot(DD,aes(x= PCT_VALMARCH)) + 
+  geom_histogram(position = "dodge")+  
+  facet_wrap(VNTENDROIT~., scales = 'free_y')
+```
+## VNTDATE, VNTANNEE, VNTMOIS
+```{r}
+
+debris %>% count(VNTDATE)
+debris %>% count(VNTANNEE)
+debris %>% count(VNTMOIS)
+
+
+ggplot(DD,aes(x=VNTDATE)) + geom_histogram()
+
+```
+
+
+## VNTMNTBRUT, VNTMNTNET
+```{r}
+ggplot(debris,aes(x=VNTMNTBRUT)) + geom_histogram(binwidth = 50)
+min(debris$VNTMNTBRUT)
+max(debris$VNTMNTBRUT) #74277181 Porshe Carrera
+
+ggplot(debris,aes(x=VNTMNTNET)) + geom_histogram(binwidth = 50)
+
+min(debris$VNTMNTNET)
+max(debris$VNTMNTNET) 
+```
+
+## VNTFRAISNET, VNTFRAISBRUT, VNTAUTFRAISNET, VNTAUTFRAISBRUT
+```{r}
+ggplot(debris,aes(x=VNTFRAISNET, fill =VNTTYPE)) + geom_histogram(binwidth = 50) + scale_y_log10()
+min(debris$VNTFRAISNET,na.rm = TRUE)
+max(debris$VNTFRAISNET,na.rm = TRUE)
+
+ggplot(debris,aes(x=VNTFRAISBRUT)) + geom_histogram(binwidth = 50)
+min(debris$VNTFRAISBRUT,na.rm = TRUE)
+max(debris$VNTFRAISBRUT,na.rm = TRUE)
+
+ggplot(debris,aes(x=VNTAUTFRAISNET)) + geom_histogram(binwidth = 50)
+min(debris$VNTAUTFRAISNET,na.rm = TRUE)
+max(debris$VNTAUTFRAISNET,na.rm = TRUE)
+
+ggplot(debris,aes(x=VNTAUTFRAISBRUT)) + geom_histogram(binwidth = 50)
+min(debris$VNTAUTFRAISBRUT,na.rm = TRUE)
+max(debris$VNTAUTFRAISBRUT,na.rm = TRUE)
+```
+
+
+## POUTREMONET, POUTREMINET, POUTAUTRENET, POUTOTALNET
+```{r}
+ggplot(debris,aes(x=POUTREMONET)) + geom_histogram(binwidth = 50)
+min(debris$POUTREMONET,na.rm = TRUE)
+max(debris$POUTREMONET,na.rm = TRUE)
+
+ggplot(debris,aes(x=POUTREMINET)) + geom_histogram(binwidth = 50)
+min(debris$POUTREMINET,na.rm = TRUE)
+max(debris$POUTREMINET,na.rm = TRUE)
+
+ggplot(debris,aes(x=POUTAUTRENET)) + geom_histogram(binwidth = 50)
+min(debris$POUTAUTRENET,na.rm = TRUE)
+max(debris$POUTAUTRENET,na.rm = TRUE)
+
+ggplot(debris,aes(x=POUTOTALNET)) + geom_histogram(binwidth = 50)
+min(debris$POUTOTALNET,na.rm = TRUE)
+max(debris$POUTOTALNET,na.rm = TRUE)
+
+
+ggplot(DD,aes(x= POUTOTALNET, y = PCT_VALMARCH)) + 
+  geom_point(alpha = 0.1) +
+  scale_x_log10() 
+
+
+ggplot(DD,aes(x= POUTOTALNET, y = VNTMNTNET)) + 
+  geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x= POUTREMINET, y = VNTMNTNET)) + 
+  geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x= POUTREMONET, y = VNTMNTNET)) + 
+  geom_point(alpha = 0.1) 
+```
+
+## DTASSIGN, DTRAMASSAGE
+```{r}
+ggplot(debris,aes(x=DTASSIGN)) + geom_histogram(binwidth = 50)
+ggplot(debris,aes(x=DTASSIGN)) + geom_histogram(aes(y =..density..) ,binwidth = 50)
+
+ggplot(debris,aes(x=DTRAMASSAGE)) + geom_histogram(binwidth = 50)
+```
+
+## REMIJOUR, REMITAUX
+```{r}
+ggplot(DD[REMIJOUR>0],aes(x=REMIJOUR)) + geom_histogram(binwidth = 1)
+max(DD$REMIJOUR)
+min(DD$REMIJOUR)
+
+
+ggplot(DD,aes(x= REMIJOUR, y = PCT_VALMARCH)) + 
+  geom_point(alpha = 0.1) 
+
+ggplot(DD[REMITAUX>0],aes(x=REMITAUX)) + geom_histogram(binwidth = 1)
+max(DD$REMITAUX)
+
+
+ggplot(DD,aes(x= REMITAUX, y = PCT_VALMARCH)) + 
+  geom_point(alpha = 0.1) +
+  scale_x_log10() + scale_y_log10()
+
+ggplot(DD,aes(x= REMITAUX, y = REMIJOUR)) + 
+  geom_point(alpha = 0.1) + xlim(0,150)
+
+```
+
+
+
+
+# Visualisation
+## x données sinistre
+```{r}
+
+
+
+ggplot(DD[CIRC_KILO<999999], aes(x=CIRC_KILO, y = PCT_VALMARCH)) + 
+  geom_point(alpha = 0.3) +   scale_x_log10() 
+
+
+ggplot(DD,aes(x= PCT_VALMARCH, fill=CIRC_CARROSSA)) + 
+  geom_histogram(position = "dodge")+   
+  scale_y_log10()  +
+  facet_grid(CIRC_CARROSSA~VNTANNEE)
+
+
+# Question pertes totales
+ggplot(DD,aes(PCT_VALMARCH, fill = CIRC_PTCAPOUV)) + geom_histogram(position = 'dodge') + facet_grid(CIRC_CARROSSA~.,scales = 'free')
+
+ggplot(DD[!is.na(CIRC_CARROSSA) & CIRC_PTCAPOUV %in% c('OUI','NON')],aes(VNTMNTNET)) + 
+  geom_histogram(position = 'dodge') + 
+  facet_grid(.~CIRC_PTCAPOUV)
+
+table(DD$VNTTYPE,DD$CIRC_PTENDROI,useNA="ifany")
+ggplot(DD,aes(VNTMNTNET, fill = CIRC_PTENDROI )) + 
+  geom_histogram(position = 'dodge') + 
+   facet_grid(CIRC_PTENDROI~.)
+
+
+
+
+-------
+table(DD$VNTTYPE,DD$CIRC_PTNBCGON,useNA="ifany")
+ggplot(DD,aes(VNTTYPE, fill = CIRC_PTNBCGON )) + geom_bar(position = 'dodge')
+
+ggplot(DD[SINI_DT_CREA>"2019-06-12"],aes(VNTMNTNET, fill = CIRC_PTNBCGON )) + 
+  geom_histogram(position = 'dodge') + 
+  xlim(0,45000) + 
+  facet_grid(CIRC_PTNBCGON~.)
+
+-------
+
+ggplot(DD,aes(x= VNTMNTNET, fill=TYPECIRC)) + 
+  geom_histogram(position = "dodge") + xlim(0,30000)
+
+ggplot(DD2,aes(x= VNTMNTNET, fill=TYPECIRC)) + 
+  geom_histogram(position = "dodge") + xlim(0,20000)
+
+DD %>% count(TYPECIRC)
+DD2 %>% count(TYPECIRC)
+
+table(DD2$TYPECIRC,DD2$VEH_AGE)
+
+-------
+table(DD$VNTTYPE,DD$CIRC_PTNBRIMP,useNA="ifany")
+ggplot(DD,aes(VNTTYPE, fill = CIRC_PTNBRIMP )) + geom_bar(position = 'dodge')
+
+table(DD$VNTTYPE,DD$CIRC_PTRADEND,useNA="ifany")
+ggplot(DD,aes(VNTTYPE, fill = CIRC_PTRADEND )) + geom_bar(position = 'dodge')
+
+table(DD$VNTTYPE,DD$CIRC_PTSITPAR,useNA="ifany")
+ggplot(DD,aes(VNTTYPE, fill = CIRC_PTSITPAR )) + geom_bar(position = 'dodge')
+
+table(DD$VNTTYPE,DD$CIRC_CARROSSA,useNA="ifany")
+ggplot(DD,aes(VNTTYPE, fill = CIRC_CARROSSA )) + geom_bar(position = 'dodge')
+
+
+ggplot(DD[],aes(x=NOSV_VAL_VEHI,y=MNT_RECOUV, color = VNTTYPE)) + geom_point()
+
+ggplot(DD[],aes(x=PROD_ANNEE,y=MNT_RECOUV, color = VNTTYPE)) + geom_point()
+
+-------
+  
+ggplot(DD2, aes(x=ENCOURU_TOTAL, y = VNTMNTNET )) + geom_point()
+
+
+DD2 %>% count(GARA_FAQ43A_PRESENCE)
+ggplot(DD2,aes(x= VNTMNTNET)) + 
+  geom_histogram(bins = 300) +
+  facet_grid(GARA_FAQ43A_PRESENCE~.) + xlim(0,10000)
+
+```
+
+
+## x données police
+```{r}
+
+DD <- DD %>% mutate(GARA_B2_PRESENCE := coalesce(GARA_B2_PRESENCE,0))
+
+
+
+
+ggplot(DD,aes(x= PCT_VALMARCH, fill=TYPECIRC)) + 
+  geom_histogram(position = "dodge")+   
+  scale_y_log10()  +
+  facet_grid(TYPECIRC~.)
+
+
+ggplot(DD[],aes(x= PCT_VALMARCH)) + 
+  geom_histogram(position = "dodge")+  
+  facet_wrap(PROD_MARQUE_VTREFVEH~., scales = 'free_y')
+
+
+DDPROD_MARQUE_VTREFVEH 
+
+ggplot(DD[],aes(x= PCT_VALMARCH)) + 
+  geom_histogram(position = "dodge")+  
+  facet_wrap(GARA_B2_PRESENCE~., scales = 'free_y')
+
+ggplot(DD[],aes(x= VNTMNTNET^(1/2))) + 
+  geom_histogram(position = "dodge")+  
+  facet_wrap(GARA_B2_PRESENCE~., scales = 'free_y')
+
+
+
+ggplot(DD[],aes(x=PROD_CONSTRUC_VTREFVEH, y= VNTMNTNET^(1/2))) + 
+  geom_point(alpha = 0.1)
+
+ggplot(DD[],aes(x=PROD_CARROSSE_VTREFVEH, y= VNTMNTNET^(1/2))) + 
+  geom_point(alpha = 0.1)
+```
+
+## x données Audatex
+```{r}
+
+ggplot(DD,aes(x=VNTDATE, y = VAL_MOY_TYPQ_AUTO)) + geom_point(alpha = 0.1) 
+
+  DD <- DD[,KM_MOY:=round(KM_MOY/1000)*1000]
+DD %>% count(KM_MOY)
+ggplot(DD,aes(x=VNTDATE, y = KM_MOY)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x=KM_MOY, y = VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x=CIRC_KILO, y = KM_MOY)) + geom_point(alpha = 0.1) +xlim(0,400000)
+
+ggplot(DD,aes(x=VNTDATE, y = MNT_GRAND_TOTL)) + geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x=VNTDATE, y = MNT_TRAV_REMPLCMNT_TOTL)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x=VNTDATE, y = MNT_TRAV_REPARTN_TOTL)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x=VNTDATE, y = NB_HR_TRAV_REMPLCMNT_TOTL)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x=VNTDATE, y = NB_HR_TRAV_REPARTN_TOTL)) + geom_point(alpha = 0.1) 
+
+
+
+ggplot(DD,aes(x= VAL_MOY_TYPQ_AUTO, y = PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= VAL_MOY_TYPQ_AUTO, y = VNTMNTNET)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= VAL_MOY_TYPQ_AUTO, y = VEHVALEUR)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1) +geom_abline(intercept = 0,slope = 0.125)
+
+ggplot(DD,aes(x= VEHVALEUR, y = log(VNTMNTNET))) + geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x= VEHVALEUR, y = VNTMNTNET)) + geom_point(alpha = 0.1)
+ggplot(DD,aes(x= VEHVALEUR, y = VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+
+
+
+ggplot(DD,aes(x= KM_MOY, y = PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= KM_MOY, y = VNTMNTNET)) + geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x= MNT_GRAND_TOTL, y = PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x= MNT_GRAND_TOTL, y = VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+
+
+ggplot(DD,aes(x= MNT_TRAV_REMPLCMNT_TOTL, y= PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= MNT_TRAV_REPARTN_TOTL, y= PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= NB_HR_TRAV_REMPLCMNT_TOTL, y= PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= NB_HR_TRAV_REPARTN_TOTL, y= PCT_VALMARCH)) + geom_point(alpha = 0.1) 
+
+ggplot(DD,aes(x= MNT_TRAV_REMPLCMNT_TOTL, y= VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= MNT_TRAV_REPARTN_TOTL, y= VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= NB_HR_TRAV_REMPLCMNT_TOTL, y= VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+ggplot(DD,aes(x= NB_HR_TRAV_REPARTN_TOTL, y= VNTMNTNET^(1/2))) + geom_point(alpha = 0.1) 
+
+
+ggplot(DD2,aes(x= MNT_GRAND_TOTL, y = ENCOURU_TOTAL)) + geom_point(alpha = 0.1) 
+ggplot(DD2,aes(x= MNT_GRAND_TOTL, y = ENCOURU_A)) + geom_point(alpha = 0.1) 
+ggplot(DD2,aes(x= MNT_GRAND_TOTL, y = ENCOURU_B2)) + geom_point(alpha = 0.1) 
+
+
+```
+# Variables retenues
+## Gestion des valeurs manquantes
+```{r}
+
+
+DD <- DD[,VEHVALEUR := case_when(DD$VEHVALEUR > 0  ~ DD$VEHVALEUR,
+                          !is.na(VAL_MOY_TYPQ_AUTO) ~ VAL_MOY_TYPQ_AUTO,
+                          !is.na(CIRC_VALJOUSI) ~ CIRC_VALJOUSI,
+                          TRUE ~ 0 )]
+
+DD <- DD[VEHVALEUR>100]
+
+
+DD <- DD[, GARA_FAQ43A_PRESENCE := coalesce(GARA_FAQ43A_PRESENCE,0)] 
+#------------
+
+
+
+missing_marque <- DD[is.na(PROD_MARQUE_VTREFVEH)]
+
+liste_marque <- na.omit(unique(DD$PROD_MARQUE_VTREFVEH)) %>% as.data.table() 
+names(liste_marque)[1] <- 'MARQUE'
+liste_marque <- liste_marque[] %>% mutate(MARQUE_dico = substr(MARQUE,1,3))
+
+marque  <- sort(na.omit(unique(DD$VEHMARQUE))) %>% as.data.table() 
+names(marque)[1] <- 'MARQUE_debris'
+marque  <- marque %>% mutate(MARQUE_debris3 = substr(MARQUE_debris,1,3) )
+
+marque <- marque[] %>% left_join(liste_marque, by=c("MARQUE_debris3" = "MARQUE_dico"))
+
+
+
+
+
+```
+## Factorisation
+```{r}
+
+VEHVALEUR
+MNT_GRAND_TOTL
+as.factor(PROD_MARQUE_VTREFVEH)
+as.factor(VEH_AGE)
+as.factor(KM_MOY)
+as.factor(TYPE_CIRC)
+as.factor(GARA_FAQ43A_PRESENCE)
+```
+
+
+# Modélisation
+## Jeux d'entrainement et de validation
+```{r}
+
+data <- copy(DD2)
+
+set.seed(1111)
+inTraining <- createDataPartition(data$PCT_VALMARCH, p = .8, list = FALSE)
+
+training <- data[ inTraining,]
+testing  <- data[-inTraining,]
+
+
+# Create custom indices: myFolds
+myFolds <- createFolds(training$PCT_VALMARCH, k = 5)
+
+# Create reusable trainControl object: myControl
+myControl <- trainControl(
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE, # IMPORTANT!
+  verboseIter = TRUE,
+  savePredictions = TRUE,
+  index = myFolds
+)
+
+ 
+ # Pour stocker les infos finales :
+ CM <- list()
+ 
+ #Pour connaitre le nombre d'observation utilisées dans chaque jeux de données 
+ Nb_jeux <- list()
+ Nb_jeux$obs_train <- nrow(training)
+ Nb_jeux$obs_test <- nrow(testing)
+
+```
+## Régression 
+### Entrainement du modèle
+```{r}
+ model_glm <- glm(VNTMNTNET ~ VEHVALEUR +  VEHANNEE  + CIRC_CARROSSA + POUTOTALNET + PROD_MARQUE_VTREFVEH + TYPECIRC, family = "gaussian", training)
+ summary(model_glm)
+ 
+  model_lm <- lm(VNTMNTNET ~ VEHVALEUR*as.factor(PROD_MARQUE_VTREFVEH) +   as.factor(VEH_AGE)*VEHVALEUR + MNT_GRAND_TOTL + CIRC_PTRADEND +  as.factor(PTNBCGON) + as.factor(KM_MOY), training)
+ summary(model_lm)
+ 
+ 
+   model_lm <- lm(VNTMNTNET ~ VEHVALEUR*as.factor(PROD_MARQUE_VTREFVEH) + 
+                    as.factor(VEH_AGE)*VEHVALEUR + as.factor(TYPECIRC) + MNT_GRAND_TOTL, training)
+ summary(model_lm)
+ 
+   model_lm <- lm(VNTMNTNET ~ VEHVALEUR + PROD_MARQUE_VTREFVEH , training)
+ summary(model_lm)
+ 
+  
+   model_lm <- lm(VNTMNTNET^(1/2) ~ VEHVALEUR , training)
+ summary(model_lm)
+ 
+    model_lm <- lm(VNTMNTNET^(1/2) ~ VEH_AGE, training)
+ summary(model_lm)
+ 
+     model_lm <- lm(VNTMNTNET ~ ENCOURU_TOTAL + MNT_GRAND_TOTL, training)
+ summary(model_lm)
+ 
+      model_lm <- lm(VNTMNTNET ~ POUTREMONET, training)
+ summary(model_lm)
+ 
+     model_lm <- lm(VNTMNTNET ~ as.factor(VEH_AGE)*VEHVALEUR, training)
+ summary(model_lm)
+ 
+ 
+    model_lm <- lm(VNTMNTNET^(1/2) ~ MNT_GRAND_TOTL , training)
+ summary(model_lm)
+ 
+    model_lm <- lm(VNTMNTNET  ~ PROD_MARQUE_VTREFVEH*VEHVALEUR , training)
+ summary(model_lm)
+ 
+     model_lm <- lm(VNTMNTNET ~ as.factor(KM_MOY) , training)
+ summary(model_lm)
+ 
+
+
+
+ 
+ 
+   model_lm <- lm(PCT_VALMARCH ~ VEHVALEUR +  VEHANNEE  + CIRC_CARROSSA + POUTOTALNET + PROD_MARQUE_VTREFVEH + TYPECIRC, training)
+ summary(model_lm)
+```
+
+### Prédiction sur le jeu de test
+```{r}
+
+ p_lm <- list()
+ p_lm$estime <- predict(model_lm, testing[], type = "response") %>%  as.data.table()
+ names(p_lm$estime)[1] <- 'estime'
+ summary(p_lm$estime)
+ 
+ compare_test_lm <- testing %>% select(NO_DOSS_INDEMN, VNTMNTNET, VEHVALEUR,VEH_AGE)
+
+ compare_test_lm <- data.table(compare_test_lm,p_lm$estime) %>%  
+   mutate(pct_ref = VNTMNTNET/VEHVALEUR, 
+          pct_estime = estime/VEHVALEUR,
+          envoi_ref = as.factor(ifelse(pct_ref <= 0.125,'achat','encan')),
+          envoi_estime = as.factor(ifelse(pct_estime <= 0.125,'achat','encan')))
+
+ compare_test_lm <- na.omit(compare_test_lm)
+ head(compare_test_lm)
+
+ ggplot(compare_test_lm, aes(x= pct_estime,fill = ifelse(pct_ref < 0.125,'red','green'))) + 
+   geom_histogram(alpha = 0.3, position = 'dodge') +geom_vline(xintercept = 0.125, color = 'red')
+ 
+  ggplot(compare_test_lm, aes(x= estime,fill = case_when(pct_ref < 0.125 & pct_estime < 0.125 ~ 'VN',
+                                                         pct_ref < 0.125 & pct_estime >= 0.125 ~ 'FP',
+                                                         pct_ref >= 0.125 & pct_estime < 0.125 ~ 'FN',
+                                                         TRUE ~ 'VP'))) + 
+   geom_histogram(alpha = 0.8, position = 'dodge') + theme(legend.position = "bottom")
+ 
+ ggplot(compare_test_lm, aes(pct_ref, pct_estime,color = ifelse(pct_estime < 0.125,'red','green'))) + 
+   geom_point(alpha = 0.3) + xlim(0,0.75) + ylim(0,0.4) + geom_vline(xintercept = 0.125)
+ 
+RMSE(x=compare_test_lm$pct_estime, ref = compare_test_lm$pct_ref,  na.rm = TRUE)
+
+
+
+confusionMatrix(compare_test_lm$envoi_estime,compare_test_lm$envoi_ref, positive = 'encan')
+
+compare_test_lm <- compare_test_lm[,val_12_5 := VEHVALEUR*.125]
+compare_test_lm <- compare_test_lm[,estime_135 := estime-135]
+compare_test_lm <- compare_test_lm[,VNTMNTNET_135 := VNTMNTNET-135]
+
+
+
+ggplot(compare_test_lm, aes(x=VEHVALEUR, y = VNTMNTNET,  color = envoi_estime)) + 
+  geom_point(alpha = 0.7) + 
+  geom_abline(slope = 0.125) + 
+  facet_grid(VEH_AGE~.) 
+ 
+```
+### Calcul de mesures selon tous les cutoff
+```{r}
+ cutoff <- vector(mode = "list", length = 100)
+p_glm$mesures <- data.table(cutoff = 1:100, accuracy = 0, kappa = 0, sensitivity = 0, specificity = 0, val_pred_pos = 0, taux_FP = 0)
+
+ x <- as.data.table(p_glm$estime ) %>% mutate(N=row_number())
+ names(x)[1] <- 'estime'
+ y <- as.data.table(testing[]) %>% select('NO_DOSS_INDEMN','PCT_VALMARCH') %>% mutate(N=row_number())
+ names(y)[2] <- 'ref'
+ p_glm$comp <- merge(x,y, by = 'N')
+ p_glm$comp$ref <- as.numeric(p_glm$comp$ref)
+ 
+ ggplot(p_glm$comp,aes(x= ref,y = estime))+ geom_point(alpha = 0.3) + xlim(0,100)
+ 
+ classe <- p_glm$comp %>% transmute(refC = case_when(ref<=10 ~ "rouge",
+                                                 ref> 15 ~ "vert",
+                                                 TRUE ~ "jaune"),
+                                estimeC = case_when(estime<=10 ~ "rouge",
+                                                 estime> 15 ~ "vert",
+                                                 TRUE ~ "jaune"))
+  table(classe$refC,classe$estimeC,deparse.level = 2)
+ 
+  classe2 <- p_glm$comp %>% transmute(refC = case_when(ref<=12.5 ~ 0,TRUE ~ 1),
+                                estimeC = case_when(estime<=12.5 ~ 0,TRUE ~ 1))
+ table(classe2$refC,classe2$estimeC,deparse.level = 2)
+
+for (i in 1:100) {
+  p_glm$comp <- p_glm$comp %>% mutate(probON = as.factor(ifelse(prob  >= i/100, "Encan", "Achat")))
+
+  cutoff[[i]] <- confusionMatrix(p_glm$comp$probON, p_glm$comp$ref, positive = "Encan")
+  
+   p_glm$mesures[i,]$accuracy <- as.numeric(cutoff[[i]]$overall[['Accuracy']])
+   p_glm$mesures[i,]$kappa <- as.numeric(cutoff[[i]]$overall[['Kappa']])
+   p_glm$mesures[i,]$sensitivity <- as.numeric(cutoff[[i]]$byClass[['Sensitivity']])
+   p_glm$mesures[i,]$specificity <- as.numeric(cutoff[[i]]$byClass[['Specificity']])
+   p_glm$mesures[i,]$val_pred_pos <- as.numeric(cutoff[[i]]$byClass[['Pos Pred Value']])
+   p_glm$mesures[i,]$taux_FP <- as.numeric(cutoff[[i]]$table[2,1]/sum(cutoff[[i]]$table))
+}
+
+CM$glm_mesures <- p_glm$mesures
+
+mesr_glm <- plot_ly(p_glm$mesures, type = 'scatter', mode = 'lines') %>% 
+  add_trace(x = ~cutoff,y = ~accuracy, name = 'accuracy') %>% 
+  add_trace(x = ~cutoff,y = ~kappa, name = 'kappa') %>% 
+  add_trace(x = ~cutoff,y = ~sensitivity, name = 'sensitivity') %>% 
+  add_trace(x = ~cutoff,y = ~val_pred_pos, name = 'val_pred_pos') %>% 
+  layout(title = "Mesures - régression logistique",
+         yaxis = list(title="")) %>% 
+  config(modeBarButtons = list(list("hoverCompareCartesian"), list('toggleSpikelines')), displaylogo = FALSE)
+
+
+mesr_glm
+max(p_glm$mesures$kappa)
+
+
+#p_glm$comp <- p_glm$comp %>% mutate(probON = as.factor(ifelse(prob  > 0.5, "Encan", "Achat")))
+#toto <- confusionMatrix(p_glm$comp$probON, p_glm$comp$ref, positive = 'Encan')
+
+```
+
+
+
+## Random Forest
+### Entrainement du modèle
+```{r}
+
+model_rf <- train(
+  VNTMNTNET~ VEH_AGE + VEHVALEUR + POUTREMONET,
+  data = training[]
+)
+
+model_rf
+plot(model_rf)
+
+```
+
+### Prédiction sur le jeu de test
+```{r}
+ p_rf <- list()
+ p_rf$estime <- predict(model_rf, testing[], type = "raw") %>%  as.data.table()
+ names(p_rf$estime)[1] <- 'estime'
+ summary(p_rf$estime)
+ 
+ compare_test_rf <- testing %>% select(NO_DOSS_INDEMN, VNTMNTNET, VEHVALEUR)
+
+ compare_test_rf <- data.table(compare_test_rf,p_lm$estime) %>%  
+   mutate(pct_ref = VNTMNTNET/VEHVALEUR, 
+          pct_estime = estime/VEHVALEUR,
+          envoi_ref = as.factor(ifelse(pct_ref <= 0.125,'achat','encan')),
+          envoi_estime = as.factor(ifelse(pct_estime <= 0.125,'achat','encan')))
+
+ compare_test_rf <- na.omit(compare_test_rf)
+ head(compare_test_rf)
+ histogram(compare_test_rf$pct_estime,breaks=10000 )
+
+ 
+ ggplot(compare_test_rf, aes(pct_ref, pct_estime,color = ifelse(pct_estime < 0.125,'red','green'))) + 
+   geom_point(alpha = 0.3) + xlim(0,0.75) + ylim(0,0.4) + geom_vline(xintercept = 0.125, color = 'red')
+ 
+RMSE(x=compare_test_rf$pct_estime, ref = compare_test_rf$pct_ref,  na.rm = TRUE)
+
+
+
+confusionMatrix(compare_test_rf$envoi_ref,compare_test_rf$envoi_estime, positive = 'encan')
+ 
+ 
+```
+
+# Calcul des gains/pertes selon le type de classement
+## Pour les véhicules de 5 ans et moins
+```{r}
+# À titre informatif seulement car l'entente nous contraint à agir ainsi
+
+
+```
+
+## Pour les véhicules de 6 à 11 ans
+
+
+
